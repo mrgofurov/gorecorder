@@ -58,3 +58,45 @@ func TestBuildAudioFFmpegArgs(t *testing.T) {
 		t.Errorf("Expected non-empty args and audio map for both")
 	}
 }
+
+func TestBuildGstreamerArgs(t *testing.T) {
+	cfgBoth := RecordConfig{
+		Resolution:  Res1080p,
+		FPS:         60,
+		AudioSource: AudioSourceBoth,
+	}
+
+	args := BuildGstreamerArgs(cfgBoth, "/tmp/test.mkv", 42, true)
+	argsStr := ""
+	for _, a := range args {
+		argsStr += a + " "
+	}
+
+	expectedElements := []string{
+		"videorate",
+		"x264enc",
+		"h264parse",
+		"audiomixer",
+		"ignore-inactive-pads=true",
+		"audiorate",
+		"avenc_aac",
+		"perfect-timestamp=true",
+		"hard-resync=true",
+		"aacparse",
+		"max-size-time=10000000000",
+		"buffer-time=2000000",
+	}
+
+	for _, elem := range expectedElements {
+		found := false
+		for _, a := range args {
+			if a == elem {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("Expected pipeline to contain %q, but was not found in: %s", elem, argsStr)
+		}
+	}
+}

@@ -53,104 +53,7 @@ func BuildAndStartFFmpeg(
 		fps = 60
 	}
 
-	// Construct GStreamer / PipeWire recording command
-	var gstArgs []string
-	gstArgs = append(gstArgs,
-		"-e",
-		"matroskamux", "name=mux", "!", "filesink", fmt.Sprintf("location=%s", tempMKV),
-	)
-
-	// Video pipeline
-	if pwFile != nil && nodeID > 0 {
-		gstArgs = append(gstArgs,
-			"pipewiresrc", "fd=3", fmt.Sprintf("path=%d", nodeID), "do-timestamp=true", "keepalive-time=1000",
-		)
-	} else if nodeID > 0 {
-		gstArgs = append(gstArgs,
-			"pipewiresrc", fmt.Sprintf("path=%d", nodeID), "do-timestamp=true", "keepalive-time=1000",
-		)
-	} else {
-		// Fallback x11
-		display := os.Getenv("DISPLAY")
-		if display == "" {
-			display = ":0"
-		}
-		gstArgs = append(gstArgs,
-			"ximagesrc", fmt.Sprintf("display-name=%s", display), "use-damage=0",
-		)
-	}
-
-	// Resolution scaling
-	var scalePipeline []string
-	switch cfg.Resolution {
-	case Res480p:
-		scalePipeline = []string{"!", "videoscale", "!", "video/x-raw,width=854,height=480"}
-	case Res720p:
-		scalePipeline = []string{"!", "videoscale", "!", "video/x-raw,width=1280,height=720"}
-	case Res1080p:
-		scalePipeline = []string{"!", "videoscale", "!", "video/x-raw,width=1920,height=1080"}
-	case Res1440p:
-		scalePipeline = []string{"!", "videoscale", "!", "video/x-raw,width=2560,height=1440"}
-	}
-
-	gstArgs = append(gstArgs, "!", "videoconvert")
-	if len(scalePipeline) > 0 {
-		gstArgs = append(gstArgs, scalePipeline...)
-	}
-
-	// Video encoder (Fast & Crisp)
-	gstArgs = append(gstArgs,
-		"!", "x264enc", "speed-preset=veryfast", "tune=zerolatency", "bitrate=5000",
-		"!", "queue",
-		"!", "mux.video_0",
-	)
-
-	// Audio pipeline (Crystal-Clear AAC 192k with jitter-free clocking)
-	micDev := cfg.MicDevice
-	if micDev == "" {
-		micDev = "default"
-	}
-	sysDev := cfg.SysDevice
-	if sysDev == "" {
-		sysDev = "@DEFAULT_SINK@.monitor"
-	}
-
-	switch cfg.AudioSource {
-	case AudioSourceMic:
-		gstArgs = append(gstArgs,
-			"pulsesrc", "provide-clock=false", "do-timestamp=true", fmt.Sprintf("device=%s", micDev),
-			"!", "audioconvert",
-			"!", "audioresample",
-			"!", "audio/x-raw,rate=48000,channels=2",
-			"!", "avenc_aac", "bitrate=192000",
-			"!", "queue",
-			"!", "mux.audio_0",
-		)
-	case AudioSourceSystem:
-		gstArgs = append(gstArgs,
-			"pulsesrc", "provide-clock=false", "do-timestamp=true", fmt.Sprintf("device=%s", sysDev),
-			"!", "audioconvert",
-			"!", "audioresample",
-			"!", "audio/x-raw,rate=48000,channels=2",
-			"!", "avenc_aac", "bitrate=192000",
-			"!", "queue",
-			"!", "mux.audio_0",
-		)
-	case AudioSourceBoth:
-		gstArgs = append(gstArgs,
-			"audiomixer", "name=mix",
-			"!", "audioconvert",
-			"!", "audioresample",
-			"!", "audio/x-raw,rate=48000,channels=2",
-			"!", "avenc_aac", "bitrate=192000",
-			"!", "queue",
-			"!", "mux.audio_0",
-			"pulsesrc", "provide-clock=false", "do-timestamp=true", fmt.Sprintf("device=%s", micDev),
-			"!", "audioconvert", "!", "audioresample", "!", "audio/x-raw,rate=48000,channels=2", "!", "queue", "!", "mix.sink_0",
-			"pulsesrc", "provide-clock=false", "do-timestamp=true", fmt.Sprintf("device=%s", sysDev),
-			"!", "audioconvert", "!", "audioresample", "!", "audio/x-raw,rate=48000,channels=2", "!", "queue", "!", "mix.sink_1",
-		)
-	}
+	gstArgs := BuildGstreamerArgs(cfg, tempMKV, nodeID, pwFile != nil)
 
 	cmd := exec.CommandContext(cmdCtx, "gst-launch-1.0", gstArgs...)
 	if pwFile != nil {
@@ -209,9 +112,9 @@ func (p *FFmpegProcess) Stop() (string, error) {
 
 	select {
 	case <-done:
-	case <-time.After(5 * time.Second):
+	case <-time.After(15 * time.Second):
 		_ = syscall.Kill(-pid, syscall.SIGTERM)
-		time.Sleep(500 * time.Millisecond)
+		time.Sleep(1 * time.Second)
 		_ = syscall.Kill(-pid, syscall.SIGKILL)
 	}
 
@@ -238,7 +141,7 @@ func (p *FFmpegProcess) Stop() (string, error) {
 
 // RemuxMKVToMP4 performs lossless stream copy remux from MKV to MP4
 func RemuxMKVToMP4(mkvPath, mp4Path string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, "ffmpeg",
@@ -269,4 +172,125 @@ func (p *FFmpegProcess) ForceKill() {
 	if p.tempMKV != "" {
 		_ = os.Remove(p.tempMKV)
 	}
+}
+
+// BuildGstreamerArgs constructs the complete GStreamer argument slice for reliable recording
+func BuildGstreamerArgs(cfg RecordConfig, tempMKV string, nodeID uint32, hasPWFile bool) []string {
+	fps := cfg.FPS
+	if fps <= 0 {
+		fps = 60
+	}
+
+	var gstArgs []string
+	gstArgs = append(gstArgs,
+		"-e",
+		"matroskamux", "name=mux", "!", "filesink", fmt.Sprintf("location=%s", tempMKV),
+	)
+
+	// Video pipeline
+	if hasPWFile && nodeID > 0 {
+		gstArgs = append(gstArgs,
+			"pipewiresrc", "fd=3", fmt.Sprintf("path=%d", nodeID), "do-timestamp=true", "keepalive-time=1000",
+		)
+	} else if nodeID > 0 {
+		gstArgs = append(gstArgs,
+			"pipewiresrc", fmt.Sprintf("path=%d", nodeID), "do-timestamp=true", "keepalive-time=1000",
+		)
+	} else {
+		// Fallback x11
+		display := os.Getenv("DISPLAY")
+		if display == "" {
+			display = ":0"
+		}
+		gstArgs = append(gstArgs,
+			"ximagesrc", fmt.Sprintf("display-name=%s", display), "use-damage=0",
+		)
+	}
+
+	// Resolution scaling
+	var scalePipeline []string
+	switch cfg.Resolution {
+	case Res480p:
+		scalePipeline = []string{"!", "videoscale", "!", "video/x-raw,width=854,height=480"}
+	case Res720p:
+		scalePipeline = []string{"!", "videoscale", "!", "video/x-raw,width=1280,height=720"}
+	case Res1080p:
+		scalePipeline = []string{"!", "videoscale", "!", "video/x-raw,width=1920,height=1080"}
+	case Res1440p:
+		scalePipeline = []string{"!", "videoscale", "!", "video/x-raw,width=2560,height=1440"}
+	}
+
+	gstArgs = append(gstArgs, "!", "videoconvert")
+	if len(scalePipeline) > 0 {
+		gstArgs = append(gstArgs, scalePipeline...)
+	}
+
+	// Video encoder (Fast & Crisp with keyframes every 2s, parsed and queued with generous 10s buffer)
+	gstArgs = append(gstArgs,
+		"!", "videorate",
+		"!", fmt.Sprintf("video/x-raw,framerate=%d/1", fps),
+		"!", "x264enc", "speed-preset=veryfast", "tune=zerolatency", "bitrate=5000", fmt.Sprintf("key-int-max=%d", fps*2),
+		"!", "h264parse",
+		"!", "queue", "max-size-buffers=0", "max-size-time=10000000000", "max-size-bytes=0",
+		"!", "mux.video_0",
+	)
+
+	// Audio pipeline (AAC 192k with audiorate sample correction, hard-resync, aacparse, and generous queues)
+	micDev := cfg.MicDevice
+	if micDev == "" {
+		micDev = "default"
+	}
+	sysDev := cfg.SysDevice
+	if sysDev == "" {
+		sysDev = "@DEFAULT_SINK@.monitor"
+	}
+
+	switch cfg.AudioSource {
+	case AudioSourceMic:
+		gstArgs = append(gstArgs,
+			"pulsesrc", "buffer-time=2000000", "latency-time=10000", fmt.Sprintf("device=%s", micDev),
+			"!", "audioconvert",
+			"!", "audioresample",
+			"!", "audiorate",
+			"!", "audio/x-raw,rate=48000,channels=2",
+			"!", "avenc_aac", "bitrate=192000", "perfect-timestamp=true", "hard-resync=true",
+			"!", "aacparse",
+			"!", "queue", "max-size-buffers=0", "max-size-time=10000000000", "max-size-bytes=0",
+			"!", "mux.audio_0",
+		)
+	case AudioSourceSystem:
+		gstArgs = append(gstArgs,
+			"pulsesrc", "buffer-time=2000000", "latency-time=10000", fmt.Sprintf("device=%s", sysDev),
+			"!", "audioconvert",
+			"!", "audioresample",
+			"!", "audiorate",
+			"!", "audio/x-raw,rate=48000,channels=2",
+			"!", "avenc_aac", "bitrate=192000", "perfect-timestamp=true", "hard-resync=true",
+			"!", "aacparse",
+			"!", "queue", "max-size-buffers=0", "max-size-time=10000000000", "max-size-bytes=0",
+			"!", "mux.audio_0",
+		)
+	case AudioSourceBoth:
+		gstArgs = append(gstArgs,
+			"audiomixer", "name=mix", "ignore-inactive-pads=true",
+			"!", "audioconvert",
+			"!", "audioresample",
+			"!", "audiorate",
+			"!", "audio/x-raw,rate=48000,channels=2",
+			"!", "avenc_aac", "bitrate=192000", "perfect-timestamp=true", "hard-resync=true",
+			"!", "aacparse",
+			"!", "queue", "max-size-buffers=0", "max-size-time=10000000000", "max-size-bytes=0",
+			"!", "mux.audio_0",
+			"pulsesrc", "buffer-time=2000000", "latency-time=10000", fmt.Sprintf("device=%s", micDev),
+			"!", "audioconvert", "!", "audioresample", "!", "audiorate", "!", "audio/x-raw,rate=48000,channels=2",
+			"!", "queue", "max-size-buffers=0", "max-size-time=5000000000", "max-size-bytes=0", "leaky=downstream",
+			"!", "mix.sink_0",
+			"pulsesrc", "buffer-time=2000000", "latency-time=10000", fmt.Sprintf("device=%s", sysDev),
+			"!", "audioconvert", "!", "audioresample", "!", "audiorate", "!", "audio/x-raw,rate=48000,channels=2",
+			"!", "queue", "max-size-buffers=0", "max-size-time=5000000000", "max-size-bytes=0", "leaky=downstream",
+			"!", "mix.sink_1",
+		)
+	}
+
+	return gstArgs
 }

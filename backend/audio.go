@@ -3,6 +3,7 @@ package backend
 import (
 	"bufio"
 	"bytes"
+	"encoding/json"
 	"os/exec"
 	"strings"
 )
@@ -13,41 +14,93 @@ type AudioSourceResult struct {
 	AudioMapArgs []string
 }
 
+type pwDumpItem struct {
+	Type string `json:"type"`
+	Info struct {
+		Props map[string]interface{} `json:"props"`
+	} `json:"info"`
+}
+
 // GetAudioDevices returns all discovered microphone inputs and system monitor sinks
 func GetAudioDevices() (mics []AudioDeviceInfo, monitors []AudioDeviceInfo) {
-	// Query pactl / pipewire pulse bridge
-	cmd := exec.Command("pactl", "list", "sources", "short")
-	out, err := cmd.Output()
-	if err == nil {
-		scanner := bufio.NewScanner(bytes.NewReader(out))
-		for scanner.Scan() {
-			line := strings.TrimSpace(scanner.Text())
-			if line == "" {
-				continue
-			}
-			parts := strings.Fields(line)
-			if len(parts) >= 2 {
-				id := parts[0]
-				name := parts[1]
-				isMonitor := strings.HasSuffix(name, ".monitor")
+	// 1. Try native PipeWire pw-dump (available on all modern PipeWire systems)
+	if pwOut, err := exec.Command("pw-dump").Output(); err == nil && len(pwOut) > 0 {
+		var items []pwDumpItem
+		if jsonErr := json.Unmarshal(pwOut, &items); jsonErr == nil {
+			for _, item := range items {
+				if item.Type != "PipeWire:Interface:Node" {
+					continue
+				}
+				mediaClass, _ := item.Info.Props["media.class"].(string)
+				nodeName, _ := item.Info.Props["node.name"].(string)
+				nodeDesc, _ := item.Info.Props["node.description"].(string)
+				nodeNick, _ := item.Info.Props["node.nick"].(string)
 
-				info := AudioDeviceInfo{
-					ID:          id,
-					Name:        name,
-					Description: formatDeviceName(name),
-					IsMonitor:   isMonitor,
+				if nodeName == "" {
+					continue
+				}
+				label := nodeDesc
+				if label == "" {
+					label = nodeNick
+				}
+				if label == "" {
+					label = simplifyAlsaName(nodeName)
 				}
 
-				if isMonitor {
-					monitors = append(monitors, info)
-				} else {
-					mics = append(mics, info)
+				if mediaClass == "Audio/Source" {
+					mics = append(mics, AudioDeviceInfo{
+						ID:          nodeName,
+						Name:        nodeName,
+						Description: "Microphone (" + label + ")",
+						IsMonitor:   false,
+					})
+				} else if mediaClass == "Audio/Sink" {
+					monitors = append(monitors, AudioDeviceInfo{
+						ID:          nodeName + ".monitor",
+						Name:        nodeName + ".monitor",
+						Description: "System Audio (" + label + ")",
+						IsMonitor:   true,
+					})
 				}
 			}
 		}
 	}
 
-	// Add default entries if empty or as fallback options
+	// 2. Fallback to pactl if pw-dump produced nothing
+	if len(mics) == 0 && len(monitors) == 0 {
+		cmd := exec.Command("pactl", "list", "sources", "short")
+		out, err := cmd.Output()
+		if err == nil {
+			scanner := bufio.NewScanner(bytes.NewReader(out))
+			for scanner.Scan() {
+				line := strings.TrimSpace(scanner.Text())
+				if line == "" {
+					continue
+				}
+				parts := strings.Fields(line)
+				if len(parts) >= 2 {
+					id := parts[0]
+					name := parts[1]
+					isMonitor := strings.HasSuffix(name, ".monitor")
+
+					info := AudioDeviceInfo{
+						ID:          id,
+						Name:        name,
+						Description: formatDeviceName(name),
+						IsMonitor:   isMonitor,
+					}
+
+					if isMonitor {
+						monitors = append(monitors, info)
+					} else {
+						mics = append(mics, info)
+					}
+				}
+			}
+		}
+	}
+
+	// 3. Add default entries if empty or as fallback options
 	if len(mics) == 0 {
 		mics = append(mics, AudioDeviceInfo{
 			ID:          "default",
